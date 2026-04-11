@@ -15,18 +15,51 @@ Usage:
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 import os
 import time
 import argparse
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
 LOGS_DIR = os.path.expanduser("~/.claude-loop/logs")
 MAX_OUTPUT_CHARS = 80000  # truncate outputs sent to planner if longer
+
+# Patterns that indicate the response is an error, not real content
+RATE_LIMIT_PATTERNS = [
+    r"You've hit your limit",
+    r"you've hit your limit",
+    r"hit your limit",
+    r"Usage limit",
+    r"usage limit",
+    r"rate limit",
+    r"Rate limit",
+    r"too many requests",
+    r"Too many requests",
+    r"429",
+    r"overloaded",
+    r"Overloaded",
+    r"capacity",
+]
+
+TIMEOUT_PATTERN = r"\(Claude Code timed out after \d+s\)"
+
+ERROR_PATTERNS = [
+    r"\(Error running Claude Code:",
+    r"permission.*denied",
+    r"ECONNREFUSED",
+    r"network error",
+    r"503",
+    r"502",
+    r"500",
+]
+
+# Minimum chars for a response to be considered "real" content
+MIN_VALID_RESPONSE_CHARS = 100
 
 PLANNER_SYSTEM_PROMPT = """\
 You are a senior tech lead and software architect. Your job is to:
@@ -60,6 +93,172 @@ def truncate(text: str, max_chars: int = MAX_OUTPUT_CHARS) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + f"\n\n... (truncated, {len(text)} total chars)"
+
+
+def parse_reset_time(text: str) -> Optional[int]:
+    """Parse a rate limit message to find seconds until reset.
+
+    Handles formats like:
+      "resets 1pm (America/Los_Angeles)"
+      "resets 2:30pm"
+      "resets in 45 minutes"
+      "resets in 1 hour"
+    Returns seconds to wait, or None if unparseable.
+    """
+    # "resets in N minutes/hours"
+    m = re.search(r"resets?\s+in\s+(\d+)\s*(minute|min|hour|hr)", text, re.IGNORECASE)
+    if m:
+        amount = int(m.group(1))
+        unit = m.group(2).lower()
+        if unit.startswith("hour") or unit.startswith("hr"):
+            return amount * 3600 + 60  # extra minute buffer
+        return amount * 60 + 60
+
+    # "resets Xam/pm" or "resets X:XXam/pm"
+    m = re.search(r"resets?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)", text, re.IGNORECASE)
+    if m:
+        hour = int(m.group(1))
+        minute = int(m.group(2)) if m.group(2) else 0
+        ampm = m.group(3).lower()
+        if ampm == "pm" and hour != 12:
+            hour += 12
+        if ampm == "am" and hour == 12:
+            hour = 0
+
+        now = datetime.now()
+        reset_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if reset_time <= now:
+            reset_time += timedelta(days=1)
+
+        wait = (reset_time - now).total_seconds()
+        return int(wait) + 60  # extra minute buffer
+
+    return None
+
+
+def classify_response(text: str) -> str:
+    """Classify a Claude response as 'ok', 'rate_limit', 'timeout', or 'error'.
+
+    Returns one of:
+      'rate_limit' — usage cap hit, should wait for reset
+      'timeout'    — claude timed out, worth retrying
+      'error'      — other error, worth retrying with backoff
+      'ok'         — valid response
+    """
+    if not text or not text.strip():
+        return "error"
+
+    for pattern in RATE_LIMIT_PATTERNS:
+        if re.search(pattern, text, re.IGNORECASE):
+            return "rate_limit"
+
+    if re.search(TIMEOUT_PATTERN, text):
+        return "timeout"
+
+    for pattern in ERROR_PATTERNS:
+        if re.search(pattern, text, re.IGNORECASE):
+            return "error"
+
+    # Very short responses are suspicious — but "GOAL COMPLETE" is short and valid
+    if len(text.strip()) < MIN_VALID_RESPONSE_CHARS and "GOAL COMPLETE" not in text.upper():
+        return "error"
+
+    return "ok"
+
+
+def wait_for_reset(text: str, phase: str) -> None:
+    """Parse rate limit reset time and sleep until then."""
+    wait_seconds = parse_reset_time(text)
+
+    if wait_seconds is None:
+        # Can't parse reset time — default to 30 minutes
+        wait_seconds = 1800
+        print(f"    Could not parse reset time. Defaulting to {wait_seconds // 60} min wait.")
+    else:
+        print(f"    Parsed reset time from message.")
+
+    # Cap at 4 hours
+    wait_seconds = min(wait_seconds, 4 * 3600)
+
+    resume_at = datetime.now() + timedelta(seconds=wait_seconds)
+    print(f"    Waiting {wait_seconds // 60} min ({wait_seconds}s) until {resume_at.strftime('%H:%M:%S')}...")
+    print(f"    (Ctrl+C to abort)\n")
+
+    # Sleep in chunks so Ctrl+C is responsive
+    remaining = wait_seconds
+    while remaining > 0:
+        chunk = min(remaining, 30)
+        time.sleep(chunk)
+        remaining -= chunk
+        if remaining > 0 and remaining % 300 < 30:
+            print(f"    ... {remaining // 60} min remaining")
+
+    print(f"    Wait complete. Resuming {phase}...\n")
+
+
+def run_claude_with_retry(
+    prompt: str,
+    cwd: str,
+    phase: str,
+    model: str = "opus",
+    system_prompt: Optional[str] = None,
+    append_system_prompt: Optional[str] = None,
+    timeout: int = 600,
+    skip_permissions: bool = False,
+    effort: Optional[str] = None,
+    max_retries: int = 3,
+) -> str:
+    """Run Claude Code with automatic retry on rate limits and errors.
+
+    On rate limit: parses reset time, sleeps until then, retries.
+    On timeout/error: retries up to max_retries with exponential backoff.
+    """
+    error_retries = 0
+    backoff = 30  # initial backoff seconds for non-rate-limit errors
+
+    while True:
+        output = run_claude(
+            prompt=prompt,
+            cwd=cwd,
+            model=model,
+            system_prompt=system_prompt,
+            append_system_prompt=append_system_prompt,
+            timeout=timeout,
+            skip_permissions=skip_permissions,
+            effort=effort,
+        )
+
+        status = classify_response(output)
+
+        if status == "ok":
+            return output
+
+        if status == "rate_limit":
+            print(f"    [!] Rate limit hit during {phase}: {output.strip()}")
+            wait_for_reset(output, phase)
+            error_retries = 0  # reset error counter after rate limit wait
+            continue
+
+        if status == "timeout":
+            error_retries += 1
+            if error_retries > max_retries:
+                print(f"    [!] {phase} timed out {max_retries} times. Returning last output.")
+                return output
+            print(f"    [!] {phase} timed out. Retry {error_retries}/{max_retries} in {backoff}s...")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 300)
+            continue
+
+        if status == "error":
+            error_retries += 1
+            if error_retries > max_retries:
+                print(f"    [!] {phase} failed {max_retries} times. Returning last output.")
+                return output
+            print(f"    [!] {phase} error ({len(output)} chars): {output.strip()[:120]}")
+            print(f"    Retry {error_retries}/{max_retries} in {backoff}s...")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 300)
+            continue
 
 
 def run_claude(
@@ -253,9 +452,10 @@ def run_loop(
 
         log_to_file(log_dir, iteration, "planner_input", planner_input)
 
-        plan = run_claude(
+        plan = run_claude_with_retry(
             prompt=planner_input,
             cwd=project_dir,
+            phase=f"planner (iter {iteration})",
             model=planner_model,
             system_prompt=PLANNER_SYSTEM_PROMPT,
             timeout=300,
@@ -288,9 +488,10 @@ def run_loop(
 
         log_to_file(log_dir, iteration, "impl_input", impl_prompt)
 
-        implementation_output = run_claude(
+        implementation_output = run_claude_with_retry(
             prompt=impl_prompt,
             cwd=project_dir,
+            phase=f"implementer (iter {iteration})",
             model=impl_model,
             append_system_prompt=IMPLEMENTER_APPEND_PROMPT,
             timeout=impl_timeout,
