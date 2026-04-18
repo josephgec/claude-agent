@@ -174,6 +174,7 @@ Every run is logged to `~/.claude-loop/logs/<timestamp>/` with one file per phas
   iter002_planner_output.md
   iter002_COMPLETE.md         # Final completion summary
   run_state.json              # Resumable state snapshot (see "Rate Limits & Resume")
+  summary.md                  # End-of-run summary: status, iterations, duration, diff stat
 ```
 
 ## Rate Limits & Resume
@@ -209,16 +210,38 @@ last completed implementation output from `run_state.json`. It reuses the existi
 directory and picks up at the next iteration if the previous one completed, or re-runs the
 current iteration from the planner if it was interrupted mid-phase.
 
+## Run Lifecycle
+
+- **Goal-completion detection** is line-anchored: a line that starts with `GOAL COMPLETE`
+  ends the loop. Substrings inside prose (e.g., "we are not yet GOAL COMPLETE") do not
+  trigger a false positive.
+- **Graceful Ctrl+C.** Hitting `Ctrl+C` at any point — including during a rate-limit
+  countdown — prints a clean interrupt message and exits with status 130. The run's
+  `run_state.json` is already on disk from the last phase boundary, so you can pick up
+  with `--resume`.
+- **Non-git projects.** If the project directory isn't a git repository, the orchestrator
+  still runs, but prints a warning: diffs, commit tracking, and "recent git log" context
+  are all skipped. Run `git init` in the project to get the richer context back.
+- **End-of-run summary.** Every completed (or max-iteration-exhausted) run writes a
+  `summary.md` to its log directory with the goal, status, duration, per-iteration
+  summaries, and — when git is available — an overall `git diff --stat` from the starting
+  HEAD to the final HEAD.
+
 ## Goal Completion
 
 The loop terminates when:
-1. The planner responds with `GOAL COMPLETE` (it reviewed the implementation and is satisfied)
+1. The planner outputs a line starting with `GOAL COMPLETE` (it reviewed the implementation
+   and is satisfied)
 2. `--max-iterations` is reached
-3. The process is interrupted
+3. The process is interrupted with `Ctrl+C` (state is preserved — resume with `--resume`)
 
 ## How the Planner Decides
 
 The planner receives a system prompt that instructs it to act as a senior tech lead:
+- **Read before planning.** The planner is told to open the files it intends to change or
+  reference before writing the plan — it doesn't plan blind from the file listing alone.
+  (The implementer already reads and writes files as part of its normal workflow, so no
+  extra nudge is needed there.)
 - Create specific, actionable plans with file paths and change descriptions
 - Review implementation output for errors, missed requirements, and bugs
 - Only declare `GOAL COMPLETE` when the overall goal is fully achieved

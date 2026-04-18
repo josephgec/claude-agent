@@ -103,6 +103,13 @@ RULES:
 - When reviewing results, check for errors, missed requirements, and bugs
 - When the overall goal is fully achieved, respond with exactly "GOAL COMPLETE" on its own line, followed by a summary
 
+BEFORE PLANNING:
+- Use your file-reading tools to inspect the files most relevant to the goal.
+- The file listing and README in the prompt are signal, not substance; open the actual
+  source files you intend to change or reference.
+- Do not plan changes to files you haven't read. If a file's contents matter to the plan,
+  read it first.
+
 OUTPUT FORMAT:
 Respond with a numbered plan. Each step should specify:
 - What file to create/modify
@@ -127,6 +134,20 @@ def truncate(text: str, max_chars: int = MAX_OUTPUT_CHARS) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + f"\n\n... (truncated, {len(text)} total chars)"
+
+
+def is_goal_complete(text: str) -> bool:
+    """True iff any line of text starts with 'GOAL COMPLETE'.
+
+    Line-start matching avoids false positives from substrings like
+    'we are not yet GOAL COMPLETE' inside a longer planner response.
+    """
+    if not text:
+        return False
+    for line in text.splitlines():
+        if line.strip().upper().startswith("GOAL COMPLETE"):
+            return True
+    return False
 
 
 def extract_summary(text: str, max_sentences: int = 3) -> str:
@@ -627,6 +648,60 @@ def log_to_file(log_dir: str, iteration: int, phase: str, content: str):
         f.write(content)
 
 
+def write_summary(
+    log_dir: str,
+    goal: str,
+    project_dir: str,
+    start_time: datetime,
+    end_time: datetime,
+    progress_log: List[Dict],
+    final_status: str,
+    initial_head: str,
+    is_git_repo: bool,
+) -> None:
+    """Write summary.md to log_dir describing the run outcome.
+
+    Wrapped in try/except so a summary-write failure never masks the real exit.
+    """
+    try:
+        duration_s = int((end_time - start_time).total_seconds())
+        final_head = git_cmd(["rev-parse", "HEAD"], project_dir) if is_git_repo else ""
+
+        lines: List[str] = [
+            f"# Run Summary: {os.path.basename(log_dir)}",
+            "",
+            f"- **Goal:** {goal}",
+            f"- **Project:** {project_dir}",
+            f"- **Status:** {final_status}",
+            f"- **Started:** {start_time.isoformat(timespec='seconds')}",
+            f"- **Ended:** {end_time.isoformat(timespec='seconds')}",
+            f"- **Duration:** {format_duration(duration_s)}",
+            f"- **Iterations completed:** {len(progress_log)}",
+        ]
+
+        if progress_log:
+            lines += ["", "## Iterations", ""]
+            for entry in progress_log:
+                lines.append(f"### Iteration {entry['iteration']}")
+                if entry.get("plan_summary"):
+                    lines.append(f"- **Plan:** {entry['plan_summary']}")
+                if entry.get("impl_summary"):
+                    lines.append(f"- **Impl:** {entry['impl_summary']}")
+                if entry.get("commit_hash"):
+                    lines.append(f"- **Commit:** `{entry['commit_hash']}`")
+                lines.append("")
+
+        if is_git_repo and initial_head and final_head and initial_head != final_head:
+            diff_stat = git_cmd(["diff", "--stat", initial_head, final_head], project_dir)
+            if diff_stat:
+                lines += ["## Changes", "", "```", diff_stat, "```", ""]
+
+        with open(os.path.join(log_dir, "summary.md"), "w") as f:
+            f.write("\n".join(lines))
+    except Exception as e:
+        print(f"    [!] Failed to write summary: {e}")
+
+
 def print_header(
     project_dir: str,
     goal: str,
@@ -684,12 +759,29 @@ def run_loop(
 
     print_header(project_dir, goal, max_iterations, log_dir, resume_from=resume_from_iteration)
 
+    # Pre-flight: warn if project isn't a git repo. Not fatal — diffs will just be empty
+    # and git-derived context will be missing — but the user should know.
+    is_git_repo = git_cmd(["rev-parse", "--is-inside-work-tree"], project_dir) == "true"
+    if not is_git_repo:
+        print(
+            "[!] Warning: project directory is not a git repository. "
+            "Diffs and commit tracking will be skipped. Run `git init` in the project "
+            "to enable full context."
+        )
+
+    # Record the HEAD we started from (used for the end-of-run summary diff).
+    initial_head = git_cmd(["rev-parse", "HEAD"], project_dir) if is_git_repo else ""
+    start_time = datetime.now()
+
     # Gather initial project context
     print("[*] Gathering project context...")
     project_context = get_project_context(project_dir)
 
     # Determine the append prompt for implementer
     impl_append = NO_AUTO_COMMIT_APPEND_PROMPT if not auto_commit else IMPLEMENTER_APPEND_PROMPT
+
+    # Default final status; overwritten on GOAL COMPLETE or interrupt.
+    final_status = "max_iterations"
 
     def build_state(phase: str, iteration: int, status: str = "running") -> Dict:
         return {
@@ -800,13 +892,14 @@ def run_loop(
         print(f"    {preview.replace(chr(10), chr(10) + '    ')}\n")
 
         # Check if goal is complete
-        if "GOAL COMPLETE" in plan.upper():
+        if is_goal_complete(plan):
             print(f"\n{'=' * 60}")
             print(f"  GOAL COMPLETE after {iteration} iteration(s)!")
             print(f"{'=' * 60}")
             print(f"\n{plan}\n")
             log_to_file(log_dir, iteration, "COMPLETE", plan)
             save_state(log_dir, build_state("completed", iteration, status="complete"))
+            final_status = "complete"
             break
 
         # ── IMPLEMENTATION PHASE ──
@@ -879,6 +972,18 @@ def run_loop(
         print(f"\n[!] Reached max iterations ({max_iterations}) without goal completion.")
         save_state(log_dir, build_state("completed", max_iterations, status="max_iterations"))
 
+    write_summary(
+        log_dir=log_dir,
+        goal=goal,
+        project_dir=project_dir,
+        start_time=start_time,
+        end_time=datetime.now(),
+        progress_log=progress_log,
+        final_status=final_status,
+        initial_head=initial_head,
+        is_git_repo=is_git_repo,
+    )
+
     print(f"\nAll logs saved to: {log_dir}")
 
 
@@ -942,82 +1047,89 @@ Examples:
 
     args = parser.parse_args()
 
-    if args.resume is not None:
-        # Resume mode: load state from disk and rebuild run parameters.
-        if args.resume == "latest":
-            run_id = find_latest_run()
-            if not run_id:
-                print("Error: no previous runs with a run_state.json found")
+    try:
+        if args.resume is not None:
+            # Resume mode: load state from disk and rebuild run parameters.
+            if args.resume == "latest":
+                run_id = find_latest_run()
+                if not run_id:
+                    print("Error: no previous runs with a run_state.json found")
+                    sys.exit(1)
+            else:
+                run_id = args.resume
+
+            state = load_state(run_id)
+            if state is None:
+                print(f"Error: no state file found for run '{run_id}'")
                 sys.exit(1)
-        else:
-            run_id = args.resume
 
-        state = load_state(run_id)
-        if state is None:
-            print(f"Error: no state file found for run '{run_id}'")
-            sys.exit(1)
+            project_dir = state["project_dir"]
+            if not os.path.isdir(project_dir):
+                print(f"Error: project directory '{project_dir}' no longer exists")
+                sys.exit(1)
 
-        project_dir = state["project_dir"]
+            log_dir = os.path.join(LOGS_DIR, run_id)
+
+            # Read the last completed implementation output if referenced.
+            resume_impl_output = None
+            last_impl_file = state.get("last_impl_output_file")
+            if last_impl_file:
+                impl_path = os.path.join(log_dir, last_impl_file)
+                if os.path.isfile(impl_path):
+                    with open(impl_path) as f:
+                        resume_impl_output = f.read()
+
+            current_phase = state.get("current_phase", "calling_planner")
+            current_iteration = state.get("current_iteration", 1)
+            if current_phase == "iteration_complete":
+                resume_from_iteration = current_iteration + 1
+            else:
+                resume_from_iteration = current_iteration
+
+            run_loop(
+                project_dir=project_dir,
+                goal=state.get("goal", ""),
+                max_iterations=state.get("max_iterations", 10),
+                planner_model=state.get("planner_model", "opus"),
+                impl_model=state.get("impl_model", "sonnet"),
+                impl_timeout=state.get("impl_timeout", 600),
+                skip_permissions=state.get("skip_permissions", False),
+                effort=state.get("effort"),
+                resume_from_iteration=resume_from_iteration,
+                resume_log_dir=log_dir,
+                resume_impl_output=resume_impl_output,
+            )
+            return
+
+        # Normal (non-resume) mode: require project_dir and goal.
+        if not args.project_dir:
+            parser.error("project_dir is required unless using --resume")
+        if not args.goal:
+            parser.error("goal is required unless using --resume")
+
+        project_dir = os.path.abspath(args.project_dir)
         if not os.path.isdir(project_dir):
-            print(f"Error: project directory '{project_dir}' no longer exists")
+            print(f"Error: '{project_dir}' is not a directory")
             sys.exit(1)
-
-        log_dir = os.path.join(LOGS_DIR, run_id)
-
-        # Read the last completed implementation output if referenced.
-        resume_impl_output = None
-        last_impl_file = state.get("last_impl_output_file")
-        if last_impl_file:
-            impl_path = os.path.join(log_dir, last_impl_file)
-            if os.path.isfile(impl_path):
-                with open(impl_path) as f:
-                    resume_impl_output = f.read()
-
-        current_phase = state.get("current_phase", "calling_planner")
-        current_iteration = state.get("current_iteration", 1)
-        if current_phase == "iteration_complete":
-            resume_from_iteration = current_iteration + 1
-        else:
-            resume_from_iteration = current_iteration
 
         run_loop(
             project_dir=project_dir,
-            goal=state.get("goal", ""),
-            max_iterations=state.get("max_iterations", 10),
-            planner_model=state.get("planner_model", "opus"),
-            impl_model=state.get("impl_model", "sonnet"),
-            impl_timeout=state.get("impl_timeout", 600),
-            skip_permissions=state.get("skip_permissions", False),
-            effort=state.get("effort"),
-            resume_from_iteration=resume_from_iteration,
-            resume_log_dir=log_dir,
-            resume_impl_output=resume_impl_output,
+            goal=args.goal,
+            max_iterations=args.max_iterations,
+            planner_model=args.planner_model,
+            impl_model=args.impl_model,
+            impl_timeout=args.impl_timeout,
+            skip_permissions=args.skip_permissions,
+            effort=args.effort,
+            auto_commit=not args.no_auto_commit,
+            dry_run=args.dry_run,
         )
-        return
-
-    # Normal (non-resume) mode: require project_dir and goal.
-    if not args.project_dir:
-        parser.error("project_dir is required unless using --resume")
-    if not args.goal:
-        parser.error("goal is required unless using --resume")
-
-    project_dir = os.path.abspath(args.project_dir)
-    if not os.path.isdir(project_dir):
-        print(f"Error: '{project_dir}' is not a directory")
-        sys.exit(1)
-
-    run_loop(
-        project_dir=project_dir,
-        goal=args.goal,
-        max_iterations=args.max_iterations,
-        planner_model=args.planner_model,
-        impl_model=args.impl_model,
-        impl_timeout=args.impl_timeout,
-        skip_permissions=args.skip_permissions,
-        effort=args.effort,
-        auto_commit=not args.no_auto_commit,
-        dry_run=args.dry_run,
-    )
+    except KeyboardInterrupt:
+        print(
+            "\n\n[!] Interrupted (Ctrl+C). State saved to the run log directory. "
+            "Resume with `--resume` to pick up where you left off."
+        )
+        sys.exit(130)
 
 
 if __name__ == "__main__":

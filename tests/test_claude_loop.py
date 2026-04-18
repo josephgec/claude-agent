@@ -43,6 +43,42 @@ class TestTruncate:
         assert claude_loop.truncate("", 100) == ""
 
 
+# ── is_goal_complete ──
+
+
+class TestIsGoalComplete:
+    def test_exact_phrase_alone(self):
+        assert claude_loop.is_goal_complete("GOAL COMPLETE") is True
+
+    def test_with_trailing_summary(self):
+        assert claude_loop.is_goal_complete("GOAL COMPLETE\nEverything shipped.") is True
+
+    def test_with_em_dash_suffix(self):
+        assert claude_loop.is_goal_complete("GOAL COMPLETE — excellent work") is True
+
+    def test_case_insensitive(self):
+        assert claude_loop.is_goal_complete("goal complete\nall done") is True
+
+    def test_not_at_line_start_is_false(self):
+        # "we are not yet GOAL COMPLETE" is a substring but NOT line-start
+        assert claude_loop.is_goal_complete("we are not yet GOAL COMPLETE") is False
+
+    def test_negation_embedded_false(self):
+        text = "This is progress, but not yet GOAL COMPLETE. More work needed."
+        assert claude_loop.is_goal_complete(text) is False
+
+    def test_multiline_with_prefix_matters(self):
+        # Real case: plan-then-verdict
+        text = "1. Do X\n2. Do Y\nGOAL COMPLETE\nAll remaining work shipped."
+        assert claude_loop.is_goal_complete(text) is True
+
+    def test_empty_string(self):
+        assert claude_loop.is_goal_complete("") is False
+
+    def test_leading_whitespace_ok(self):
+        assert claude_loop.is_goal_complete("   GOAL COMPLETE") is True
+
+
 # ── classify_response ──
 
 
@@ -1347,6 +1383,67 @@ class TestRunLoop:
         )
         assert any("PRIOR_IMPL_MARKER" in p for p in captured_prompts)
 
+    def test_non_git_repo_warning(self, monkeypatch, tmp_path, capsys):
+        """A non-git project directory should trigger a warning, not a crash."""
+        # Deliberately NOT calling self._init_git.
+        planner_calls = {"n": 0}
+
+        def fake(prompt, cwd, phase, **kwargs):
+            if kwargs.get("system_prompt"):
+                planner_calls["n"] += 1
+                return "GOAL COMPLETE\nNothing to do."
+            return "never"
+
+        monkeypatch.setattr(claude_loop, "run_claude_with_retry", fake)
+        monkeypatch.setattr(claude_loop, "LOGS_DIR", str(tmp_path / "logs"))
+
+        claude_loop.run_loop(str(tmp_path), "goal", max_iterations=1)
+        output = capsys.readouterr().out
+        assert "not a git repository" in output.lower() or "git init" in output
+
+    def test_summary_written_on_goal_complete(self, monkeypatch, tmp_path):
+        self._init_git(tmp_path)
+        planner_calls = {"n": 0}
+
+        def fake(prompt, cwd, phase, **kwargs):
+            if kwargs.get("system_prompt"):
+                planner_calls["n"] += 1
+                if planner_calls["n"] == 1:
+                    return "1. Step" + "x" * 100
+                return "GOAL COMPLETE\nDone."
+            return "Implemented step." + "x" * 100
+
+        monkeypatch.setattr(claude_loop, "run_claude_with_retry", fake)
+        monkeypatch.setattr(claude_loop, "LOGS_DIR", str(tmp_path / "logs"))
+
+        claude_loop.run_loop(str(tmp_path), "build x", max_iterations=3)
+
+        run_dirs = os.listdir(str(tmp_path / "logs"))
+        summary_path = tmp_path / "logs" / run_dirs[0] / "summary.md"
+        assert summary_path.exists()
+        content = summary_path.read_text()
+        assert "build x" in content
+        assert "complete" in content.lower()
+        assert "Iteration 1" in content
+
+    def test_summary_written_on_max_iterations(self, monkeypatch, tmp_path):
+        self._init_git(tmp_path)
+
+        def fake(prompt, cwd, phase, **kwargs):
+            if kwargs.get("system_prompt"):
+                return "1. Keep going\n2. Never done" + "x" * 100
+            return "made some progress" + "x" * 100
+
+        monkeypatch.setattr(claude_loop, "run_claude_with_retry", fake)
+        monkeypatch.setattr(claude_loop, "LOGS_DIR", str(tmp_path / "logs"))
+
+        claude_loop.run_loop(str(tmp_path), "endless", max_iterations=2)
+        run_dirs = os.listdir(str(tmp_path / "logs"))
+        summary_path = tmp_path / "logs" / run_dirs[0] / "summary.md"
+        assert summary_path.exists()
+        content = summary_path.read_text()
+        assert "max_iterations" in content
+
     def test_commit_validation_warning(self, monkeypatch, tmp_path, capsys):
         """Warns when HEAD doesn't change after implementation."""
         self._init_git(tmp_path)
@@ -1366,6 +1463,62 @@ class TestRunLoop:
         claude_loop.run_loop(str(tmp_path), "test", max_iterations=5)
         output = capsys.readouterr().out
         assert "did not commit" in output
+
+
+# ── write_summary ──
+
+
+class TestWriteSummary:
+    def _basic_progress_log(self):
+        return [
+            {"iteration": 1, "plan_summary": "Plan one.", "impl_summary": "Did one.",
+             "commit_hash": "abc12345", "head_before": "0", "head_after": "abc12345"},
+            {"iteration": 2, "plan_summary": "Plan two.", "impl_summary": "Did two.",
+             "commit_hash": "def67890", "head_before": "abc12345", "head_after": "def67890"},
+        ]
+
+    def test_writes_summary_file(self, tmp_path):
+        from datetime import datetime, timedelta
+        start = datetime(2026, 4, 17, 12, 0, 0)
+        end = start + timedelta(minutes=3, seconds=15)
+        claude_loop.write_summary(
+            log_dir=str(tmp_path), goal="build it", project_dir="/p",
+            start_time=start, end_time=end,
+            progress_log=self._basic_progress_log(),
+            final_status="complete", initial_head="", is_git_repo=False,
+        )
+        path = tmp_path / "summary.md"
+        assert path.exists()
+        text = path.read_text()
+        assert "build it" in text
+        assert "complete" in text
+        assert "Iteration 1" in text
+        assert "Iteration 2" in text
+        assert "3m 15s" in text  # format_duration output
+
+    def test_summary_interrupted_status(self, tmp_path):
+        from datetime import datetime
+        claude_loop.write_summary(
+            log_dir=str(tmp_path), goal="g", project_dir="/p",
+            start_time=datetime.now(), end_time=datetime.now(),
+            progress_log=[], final_status="interrupted",
+            initial_head="", is_git_repo=False,
+        )
+        text = (tmp_path / "summary.md").read_text()
+        assert "interrupted" in text
+
+    def test_summary_never_raises(self, tmp_path, capsys):
+        # Target a directory that doesn't exist to provoke a write failure.
+        from datetime import datetime
+        bad = str(tmp_path / "no_such_dir")
+        claude_loop.write_summary(
+            log_dir=bad, goal="g", project_dir="/p",
+            start_time=datetime.now(), end_time=datetime.now(),
+            progress_log=[], final_status="complete",
+            initial_head="", is_git_repo=False,
+        )
+        output = capsys.readouterr().out
+        assert "Failed to write summary" in output
 
 
 # ── main (argparse) ──
@@ -1612,6 +1765,23 @@ class TestMain:
         with pytest.raises(SystemExit):
             claude_loop.main()
 
+    def test_keyboard_interrupt_exits_cleanly(self, monkeypatch, tmp_path, capsys):
+        """Ctrl+C during a run should produce a clean message and SIGINT exit code."""
+        def fake_run_loop(**kwargs):
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(claude_loop, "run_loop", fake_run_loop)
+        monkeypatch.setattr(
+            sys, "argv",
+            ["claude_loop.py", str(tmp_path), "goal"],
+        )
+        with pytest.raises(SystemExit) as exc:
+            claude_loop.main()
+        assert exc.value.code == 130
+        output = capsys.readouterr().out
+        assert "Interrupted" in output
+        assert "--resume" in output
+
 
 # ── Constants ──
 
@@ -1619,6 +1789,16 @@ class TestMain:
 class TestConstants:
     def test_planner_prompt_has_goal_complete_instruction(self):
         assert "GOAL COMPLETE" in claude_loop.PLANNER_SYSTEM_PROMPT
+
+    def test_planner_prompt_nudges_file_reading(self):
+        """Planner must be told to read files before planning (not plan blind)."""
+        prompt = claude_loop.PLANNER_SYSTEM_PROMPT.lower()
+        # Accept any of these phrasings so the test tolerates future wording tweaks.
+        assert (
+            "file-reading tools" in prompt
+            or "read" in prompt and "files" in prompt
+        )
+        assert "do not plan changes to files you haven't read" in prompt
 
     def test_implementer_prompt_mentions_commit(self):
         assert "commit" in claude_loop.IMPLEMENTER_APPEND_PROMPT.lower()
