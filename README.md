@@ -134,6 +134,9 @@ python3 claude_loop.py <project_dir> "<goal>" \
 | `--effort` | model default | Effort level: `low`, `medium`, `high`, `max` |
 | `--impl-timeout` | `600` | Timeout in seconds per implementation round |
 | `--skip-permissions` | off | Skip permission checks (sandboxed environments only) |
+| `--no-auto-commit` | off | Leave changes for manual review instead of committing |
+| `--dry-run` | off | Print the planner prompt and exit without calling Claude |
+| `--resume [RUN_ID]` | off | Resume a previous run. Omit `RUN_ID` to resume the most recent run. |
 
 ### Examples
 
@@ -151,6 +154,10 @@ python3 claude_loop.py ./my-app "Convert all JavaScript files to TypeScript" \
 
 # Automated test improvement
 python3 claude_loop.py ./my-app "Achieve 90% test coverage" --skip-permissions
+
+# Resume after a crash (or after --resume'ing through a rate-limit wait)
+python3 claude_loop.py --resume                      # pick up the most recent run
+python3 claude_loop.py --resume 20260115_120000      # resume a specific run ID
 ```
 
 ## Logs
@@ -165,8 +172,42 @@ Every run is logged to `~/.claude-loop/logs/<timestamp>/` with one file per phas
   iter001_impl_output.md      # Implementation results
   iter002_planner_input.md
   iter002_planner_output.md
-  iter002_COMPLETE.md          # Final completion summary
+  iter002_COMPLETE.md         # Final completion summary
+  run_state.json              # Resumable state snapshot (see "Rate Limits & Resume")
 ```
+
+## Rate Limits & Resume
+
+The orchestrator is designed to run unattended through long sessions, including rate-limit waits.
+
+**Automatic rate-limit handling.** When the Claude CLI returns a usage-limit, quota, throttle,
+overloaded, or 429 response, the orchestrator:
+
+1. Parses the reset time from the error message. It understands many phrasings, including
+   `resets in 45 minutes`, `try again in 30 seconds`, `retry after 2 minutes`, `please wait 5 minutes`,
+   `resets 2:30pm`, `resets at 14:30`, and bare `Retry-After: 60` HTTP-style headers.
+2. Sleeps until the reset time with a live in-place countdown and 2-second poll chunks so
+   `Ctrl+C` remains responsive.
+3. Retries automatically. Error backoff (30s → 60s → … capped at 300s) is reset after a
+   clean rate-limit recovery so transient errors do not inflate the wait of future retries.
+
+If the message can't be parsed the loop defaults to a 15-minute wait, capped at 4 hours.
+
+**State persistence & crash recovery.** Every iteration writes a `run_state.json` under
+`~/.claude-loop/logs/<run_id>/` before each planner call, before each implementer call, and
+after each completed iteration. State is also flushed to disk just before any rate-limit sleep.
+This means you can kill the process (or lose the machine) during a multi-hour wait and recover
+with:
+
+```bash
+python3 claude_loop.py --resume                 # resume the most recent run
+python3 claude_loop.py --resume <run_id>        # resume a specific run by log-directory name
+```
+
+On resume, the orchestrator reloads project path, goal, models, effort, timeout, and the
+last completed implementation output from `run_state.json`. It reuses the existing log
+directory and picks up at the next iteration if the previous one completed, or re-runs the
+current iteration from the planner if it was interrupted mid-phase.
 
 ## Goal Completion
 

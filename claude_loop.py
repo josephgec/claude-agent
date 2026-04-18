@@ -24,7 +24,7 @@ import argparse
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 # Force unbuffered stdout for background execution
 os.environ["PYTHONUNBUFFERED"] = "1"
@@ -33,6 +33,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 LOGS_DIR = os.path.expanduser("~/.claude-loop/logs")
 MAX_OUTPUT_CHARS = 80000  # truncate outputs sent to planner if longer
+STATE_FILE = "run_state.json"
 
 # Patterns that indicate the response is an error, not real content
 RATE_LIMIT_PATTERNS = [
@@ -49,6 +50,16 @@ RATE_LIMIT_PATTERNS = [
     r"overloaded",
     r"Overloaded",
     r"at capacity",
+    r"quota exceeded",
+    r"Quota exceeded",
+    r"please try again later",
+    r"Please try again later",
+    r"limit reached",
+    r"Limit reached",
+    r"throttled",
+    r"Throttled",
+    r"maximum.*requests",
+    r"cooldown",
 ]
 
 TIMEOUT_PATTERN = r"\(Claude Code timed out after \d+s\)"
@@ -132,6 +143,49 @@ def extract_summary(text: str, max_sentences: int = 3) -> str:
     return summary
 
 
+def save_state(log_dir: str, state_dict: Dict) -> None:
+    """Persist run state to JSON for crash recovery.
+
+    Wrapped in try/except so write failures never crash the loop.
+    """
+    try:
+        state_path = os.path.join(log_dir, STATE_FILE)
+        data = dict(state_dict)
+        data["saved_at"] = datetime.now().isoformat()
+        with open(state_path, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"    [!] Failed to save state: {e}")
+
+
+def load_state(run_id: str) -> Optional[Dict]:
+    """Read run_state.json for a given run_id. Returns None if missing."""
+    state_path = os.path.join(LOGS_DIR, run_id, STATE_FILE)
+    if not os.path.isfile(state_path):
+        return None
+    try:
+        with open(state_path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def find_latest_run() -> Optional[str]:
+    """Return the run_id of the most recent run that has a run_state.json."""
+    if not os.path.isdir(LOGS_DIR):
+        return None
+    candidates = []
+    for name in os.listdir(LOGS_DIR):
+        path = os.path.join(LOGS_DIR, name)
+        state_file = os.path.join(path, STATE_FILE)
+        if os.path.isdir(path) and os.path.isfile(state_file):
+            candidates.append((os.path.getmtime(state_file), name))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+
 def format_progress_section(progress_log: List[Dict]) -> str:
     """Format progress log entries into a section for the planner prompt.
 
@@ -176,18 +230,29 @@ def parse_reset_time(text: str) -> Optional[int]:
     Handles formats like:
       "resets 1pm (America/Los_Angeles)"
       "resets 2:30pm"
-      "resets in 45 minutes"
+      "resets at 14:30"
+      "resets in 45 minutes" / "try again in 30 seconds" / "retry after 2 minutes"
       "resets in 1 hour"
+      "retry-after: 60"
     Returns seconds to wait, or None if unparseable.
     """
-    # "resets in N minutes/hours"
-    m = re.search(r"resets?\s+in\s+(\d+)\s*(minute|min|hour|hr)", text, re.IGNORECASE)
+    # "resets in N", "try again in N", "retry after N", "wait N", "available in N"
+    # with seconds / minutes / hours
+    m = re.search(
+        r"(?:resets?\s+in|try\s+again\s+in|retry\s+after|wait|available\s+in)"
+        r"\s+(\d+)\s*(second|sec|minute|min|hour|hr)",
+        text,
+        re.IGNORECASE,
+    )
     if m:
         amount = int(m.group(1))
         unit = m.group(2).lower()
         if unit.startswith("hour") or unit.startswith("hr"):
             return amount * 3600 + 60  # extra minute buffer
-        return amount * 60 + 60
+        if unit.startswith("min"):
+            return amount * 60 + 60
+        # seconds
+        return amount + 60
 
     # "resets Xam/pm" or "resets X:XXam/pm"
     m = re.search(r"resets?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)", text, re.IGNORECASE)
@@ -207,6 +272,24 @@ def parse_reset_time(text: str) -> Optional[int]:
 
         wait = (reset_time - now).total_seconds()
         return int(wait) + 60  # extra minute buffer
+
+    # "resets at HH:MM" (24-hour, no am/pm)
+    m = re.search(r"resets?\s+at\s+(\d{1,2}):(\d{2})(?!\s*(?:am|pm))", text, re.IGNORECASE)
+    if m:
+        hour = int(m.group(1))
+        minute = int(m.group(2))
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            now = datetime.now()
+            reset_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if reset_time <= now:
+                reset_time += timedelta(days=1)
+            wait = (reset_time - now).total_seconds()
+            return int(wait) + 60
+
+    # "retry-after: N" (bare header-style, treat as seconds)
+    m = re.search(r"retry[-\s]after\s*[:=]\s*(\d+)", text, re.IGNORECASE)
+    if m:
+        return int(m.group(1)) + 60
 
     return None
 
@@ -269,34 +352,59 @@ def classify_response(stdout: str, stderr: str = "", returncode: int = 0) -> str
     return "ok"
 
 
+def format_duration(seconds: int) -> str:
+    """Format a duration as Xs, Xm Ys, or Xh Ym."""
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        m, s = divmod(seconds, 60)
+        return f"{m}m {s}s"
+    h, rem = divmod(seconds, 3600)
+    m = rem // 60
+    return f"{h}h {m}m"
+
+
+def wait_with_countdown(wait_seconds: int, phase: str) -> None:
+    """Sleep for wait_seconds, updating a single-line countdown every 30s.
+
+    Uses 2-second sleep chunks so Ctrl+C is responsive.
+    """
+    resume_at = datetime.now() + timedelta(seconds=wait_seconds)
+    print(f"    Waiting {format_duration(wait_seconds)} until {resume_at.strftime('%H:%M:%S')}...")
+    print(f"    (Ctrl+C to abort)")
+
+    remaining = wait_seconds
+    last_update = None  # remaining value at which we last redrew the line
+    while remaining > 0:
+        if last_update is None or (last_update - remaining) >= 30 or remaining < 30:
+            sys.stdout.write(f"\r    {format_duration(remaining)} remaining...    ")
+            sys.stdout.flush()
+            last_update = remaining
+        chunk = min(remaining, 2)
+        time.sleep(chunk)
+        remaining -= chunk
+
+    # Clear the countdown line
+    sys.stdout.write("\r" + " " * 60 + "\r")
+    sys.stdout.flush()
+    print(f"    Wait complete. Resuming {phase}...\n")
+
+
 def wait_for_reset(text: str, phase: str) -> None:
     """Parse rate limit reset time and sleep until then."""
     wait_seconds = parse_reset_time(text)
 
     if wait_seconds is None:
-        # Can't parse reset time -- default to 30 minutes
-        wait_seconds = 1800
-        print(f"    Could not parse reset time. Defaulting to {wait_seconds // 60} min wait.")
+        # Can't parse reset time -- default to 15 minutes
+        wait_seconds = 900
+        print(f"    Could not parse reset time. Defaulting to {format_duration(wait_seconds)} wait.")
     else:
         print(f"    Parsed reset time from message.")
 
     # Cap at 4 hours
     wait_seconds = min(wait_seconds, 4 * 3600)
 
-    resume_at = datetime.now() + timedelta(seconds=wait_seconds)
-    print(f"    Waiting {wait_seconds // 60} min ({wait_seconds}s) until {resume_at.strftime('%H:%M:%S')}...")
-    print(f"    (Ctrl+C to abort)\n")
-
-    # Sleep in chunks so Ctrl+C is responsive
-    remaining = wait_seconds
-    while remaining > 0:
-        chunk = min(remaining, 30)
-        time.sleep(chunk)
-        remaining -= chunk
-        if remaining > 0 and remaining % 300 < 30:
-            print(f"    ... {remaining // 60} min remaining")
-
-    print(f"    Wait complete. Resuming {phase}...\n")
+    wait_with_countdown(wait_seconds, phase)
 
 
 def run_claude_with_retry(
@@ -310,11 +418,14 @@ def run_claude_with_retry(
     skip_permissions: bool = False,
     effort: Optional[str] = None,
     max_retries: int = 3,
+    state_save_callback: Optional[Callable[[], None]] = None,
 ) -> str:
     """Run Claude Code with automatic retry on rate limits and errors.
 
     On rate limit: parses reset time, sleeps until then, retries.
     On timeout/error: retries up to max_retries with exponential backoff.
+    If state_save_callback is provided, it's invoked just before entering a
+    rate-limit wait so state is persisted to disk before any long sleep.
     Returns the stdout string to callers.
     """
     error_retries = 0
@@ -344,8 +455,14 @@ def run_claude_with_retry(
 
         if status == "rate_limit":
             print(f"    [!] Rate limit hit during {phase}: {combined.strip()[:200]}")
+            if state_save_callback is not None:
+                try:
+                    state_save_callback()
+                except Exception as e:
+                    print(f"    [!] state_save_callback failed: {e}")
             wait_for_reset(combined, phase)
             error_retries = 0  # reset error counter after rate limit wait
+            backoff = 30       # reset backoff too after clean rate-limit recovery
             continue
 
         if status == "timeout":
@@ -510,67 +627,13 @@ def log_to_file(log_dir: str, iteration: int, phase: str, content: str):
         f.write(content)
 
 
-def resume_from_logs(log_dir: str) -> Tuple[str, int, List[Dict], str]:
-    """Scan log directory and reconstruct state from a previous run.
-
-    Returns (goal, last_completed_iteration, progress_log, last_impl_output).
-    """
-    if not os.path.isdir(log_dir):
-        print(f"Error: log directory '{log_dir}' does not exist")
-        sys.exit(1)
-
-    files = sorted(os.listdir(log_dir))
-
-    # Find the goal from the first planner input
-    goal = ""
-    for f in files:
-        if "planner_input" in f:
-            filepath = os.path.join(log_dir, f)
-            with open(filepath) as fh:
-                content = fh.read()
-            # Extract goal from "GOAL: ..." or "OVERALL GOAL: ..."
-            m = re.search(r"(?:OVERALL )?GOAL:\s*(.+?)(?:\n|$)", content)
-            if m:
-                goal = m.group(1).strip()
-            break
-
-    # Find highest completed iteration (has both planner_output and impl_output)
-    max_iter = 0
-    for f in files:
-        m = re.match(r"iter(\d+)_impl_output\.md", f)
-        if m:
-            n = int(m.group(1))
-            if n > max_iter:
-                max_iter = n
-
-    # Reconstruct progress log
-    progress_log = []  # type: List[Dict]
-    last_impl_output = ""
-
-    for i in range(1, max_iter + 1):
-        entry = {"iteration": i, "plan_summary": "", "impl_summary": "",
-                 "commit_hash": "", "head_before": "", "head_after": ""}
-
-        plan_file = os.path.join(log_dir, f"iter{i:03d}_planner_output.md")
-        if os.path.isfile(plan_file):
-            with open(plan_file) as fh:
-                plan_text = fh.read()
-            entry["plan_summary"] = extract_summary(plan_text)
-
-        impl_file = os.path.join(log_dir, f"iter{i:03d}_impl_output.md")
-        if os.path.isfile(impl_file):
-            with open(impl_file) as fh:
-                impl_text = fh.read()
-            entry["impl_summary"] = extract_summary(impl_text)
-            if i == max_iter:
-                last_impl_output = impl_text
-
-        progress_log.append(entry)
-
-    return (goal, max_iter, progress_log, last_impl_output)
-
-
-def print_header(project_dir: str, goal: str, max_iterations: int, log_dir: str):
+def print_header(
+    project_dir: str,
+    goal: str,
+    max_iterations: int,
+    log_dir: str,
+    resume_from: Optional[int] = None,
+):
     print(f"\n{'=' * 60}")
     print(f"  Claude Loop Orchestrator")
     print(f"{'=' * 60}")
@@ -578,6 +641,8 @@ def print_header(project_dir: str, goal: str, max_iterations: int, log_dir: str)
     print(f"  Goal:           {goal}")
     print(f"  Max iterations: {max_iterations}")
     print(f"  Logs:           {log_dir}")
+    if resume_from is not None:
+        print(f"  Resuming from:  iteration {resume_from}")
     print(f"{'=' * 60}\n")
 
 
@@ -592,30 +657,32 @@ def run_loop(
     effort: Optional[str] = None,
     auto_commit: bool = True,
     dry_run: bool = False,
-    resume_run_id: Optional[str] = None,
+    resume_from_iteration: Optional[int] = None,
+    resume_log_dir: Optional[str] = None,
+    resume_impl_output: Optional[str] = None,
 ):
     """Main orchestration loop."""
-    # Handle resume
     progress_log = []  # type: List[Dict]
-    start_iteration = 1
-    implementation_output = None
 
-    if resume_run_id:
-        log_dir = os.path.join(LOGS_DIR, resume_run_id)
-        resumed_goal, last_iter, progress_log, last_impl = resume_from_logs(log_dir)
-        if not goal:
-            goal = resumed_goal
-        start_iteration = last_iter + 1
-        implementation_output = last_impl if last_impl else None
-        print(f"[*] Resuming from iteration {start_iteration} (run {resume_run_id})")
-        run_id = resume_run_id
+    if resume_log_dir:
+        log_dir = resume_log_dir
+        start_iteration = resume_from_iteration or 1
+        implementation_output = resume_impl_output
+        # The most recent completed impl file predates the iteration we restart on
+        last_impl_file = (
+            f"iter{start_iteration - 1:03d}_impl_output.md" if start_iteration > 1 else None
+        )
+        print(f"[*] Resuming from iteration {start_iteration} (run {os.path.basename(log_dir)})")
     else:
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         log_dir = os.path.join(LOGS_DIR, run_id)
+        start_iteration = 1
+        implementation_output = None
+        last_impl_file = None
 
     os.makedirs(log_dir, exist_ok=True)
 
-    print_header(project_dir, goal, max_iterations, log_dir)
+    print_header(project_dir, goal, max_iterations, log_dir, resume_from=resume_from_iteration)
 
     # Gather initial project context
     print("[*] Gathering project context...")
@@ -623,6 +690,22 @@ def run_loop(
 
     # Determine the append prompt for implementer
     impl_append = NO_AUTO_COMMIT_APPEND_PROMPT if not auto_commit else IMPLEMENTER_APPEND_PROMPT
+
+    def build_state(phase: str, iteration: int, status: str = "running") -> Dict:
+        return {
+            "project_dir": project_dir,
+            "goal": goal,
+            "max_iterations": max_iterations,
+            "planner_model": planner_model,
+            "impl_model": impl_model,
+            "impl_timeout": impl_timeout,
+            "skip_permissions": skip_permissions,
+            "effort": effort,
+            "current_iteration": iteration,
+            "current_phase": phase,
+            "status": status,
+            "last_impl_output_file": last_impl_file,
+        }
 
     # Dry run: print planner prompt and exit
     if dry_run:
@@ -694,6 +777,8 @@ def run_loop(
 
         log_to_file(log_dir, iteration, "planner_input", planner_input)
 
+        save_state(log_dir, build_state("calling_planner", iteration))
+
         plan = run_claude_with_retry(
             prompt=planner_input,
             cwd=project_dir,
@@ -702,6 +787,9 @@ def run_loop(
             system_prompt=PLANNER_SYSTEM_PROMPT,
             timeout=impl_timeout,
             effort=effort,
+            state_save_callback=lambda it=iteration: save_state(
+                log_dir, build_state("calling_planner", it)
+            ),
         )
 
         log_to_file(log_dir, iteration, "planner_output", plan)
@@ -718,6 +806,7 @@ def run_loop(
             print(f"{'=' * 60}")
             print(f"\n{plan}\n")
             log_to_file(log_dir, iteration, "COMPLETE", plan)
+            save_state(log_dir, build_state("completed", iteration, status="complete"))
             break
 
         # ── IMPLEMENTATION PHASE ──
@@ -733,6 +822,8 @@ def run_loop(
 
         log_to_file(log_dir, iteration, "impl_input", impl_prompt)
 
+        save_state(log_dir, build_state("calling_implementer", iteration))
+
         implementation_output = run_claude_with_retry(
             prompt=impl_prompt,
             cwd=project_dir,
@@ -742,9 +833,13 @@ def run_loop(
             timeout=impl_timeout,
             skip_permissions=skip_permissions,
             effort=effort,
+            state_save_callback=lambda it=iteration: save_state(
+                log_dir, build_state("calling_implementer", it)
+            ),
         )
 
         log_to_file(log_dir, iteration, "impl_output", implementation_output)
+        last_impl_file = f"iter{iteration:03d}_impl_output.md"
 
         # Capture HEAD after implementation
         head_after = git_cmd(["rev-parse", "HEAD"], project_dir)
@@ -778,8 +873,11 @@ def run_loop(
         )
         print(f"[{iteration}] Implementation done ({len(implementation_output)} chars):\n")
         print(f"    {impl_preview.replace(chr(10), chr(10) + '    ')}\n")
+
+        save_state(log_dir, build_state("iteration_complete", iteration))
     else:
         print(f"\n[!] Reached max iterations ({max_iterations}) without goal completion.")
+        save_state(log_dir, build_state("completed", max_iterations, status="max_iterations"))
 
     print(f"\nAll logs saved to: {log_dir}")
 
@@ -795,10 +893,14 @@ Examples:
   %(prog)s ./my-project "Refactor to use TypeScript" --planner-model opus --impl-model sonnet
   %(prog)s ./my-project "Build a CLI tool" --skip-permissions
   %(prog)s ./my-project --dry-run "Preview the prompt"
-  %(prog)s ./my-project --resume 20240101_120000
+  %(prog)s --resume                      # resume the most recent run
+  %(prog)s --resume 20240101_120000      # resume a specific run by ID
 """,
     )
-    parser.add_argument("project_dir", help="Path to the project directory")
+    parser.add_argument(
+        "project_dir", nargs="?", default=None,
+        help="Path to the project directory (omit when using --resume)",
+    )
     parser.add_argument("goal", nargs="?", default=None, help="The goal/task to accomplish")
     parser.add_argument(
         "--max-iterations", type=int, default=10,
@@ -829,8 +931,9 @@ Examples:
         help="Do not auto-commit; leave changes for manual review",
     )
     parser.add_argument(
-        "--resume", metavar="RUN_ID", default=None,
-        help="Resume a previous run by its run ID (log directory name)",
+        "--resume", nargs="?", const="latest", default=None, metavar="RUN_ID",
+        help="Resume a previous run. Pass a run ID (log directory name), "
+             "or use --resume alone to resume the most recent run.",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -839,9 +942,64 @@ Examples:
 
     args = parser.parse_args()
 
-    # Validate: need either goal or --resume
-    if not args.goal and not args.resume:
-        parser.error("either a goal argument or --resume is required")
+    if args.resume is not None:
+        # Resume mode: load state from disk and rebuild run parameters.
+        if args.resume == "latest":
+            run_id = find_latest_run()
+            if not run_id:
+                print("Error: no previous runs with a run_state.json found")
+                sys.exit(1)
+        else:
+            run_id = args.resume
+
+        state = load_state(run_id)
+        if state is None:
+            print(f"Error: no state file found for run '{run_id}'")
+            sys.exit(1)
+
+        project_dir = state["project_dir"]
+        if not os.path.isdir(project_dir):
+            print(f"Error: project directory '{project_dir}' no longer exists")
+            sys.exit(1)
+
+        log_dir = os.path.join(LOGS_DIR, run_id)
+
+        # Read the last completed implementation output if referenced.
+        resume_impl_output = None
+        last_impl_file = state.get("last_impl_output_file")
+        if last_impl_file:
+            impl_path = os.path.join(log_dir, last_impl_file)
+            if os.path.isfile(impl_path):
+                with open(impl_path) as f:
+                    resume_impl_output = f.read()
+
+        current_phase = state.get("current_phase", "calling_planner")
+        current_iteration = state.get("current_iteration", 1)
+        if current_phase == "iteration_complete":
+            resume_from_iteration = current_iteration + 1
+        else:
+            resume_from_iteration = current_iteration
+
+        run_loop(
+            project_dir=project_dir,
+            goal=state.get("goal", ""),
+            max_iterations=state.get("max_iterations", 10),
+            planner_model=state.get("planner_model", "opus"),
+            impl_model=state.get("impl_model", "sonnet"),
+            impl_timeout=state.get("impl_timeout", 600),
+            skip_permissions=state.get("skip_permissions", False),
+            effort=state.get("effort"),
+            resume_from_iteration=resume_from_iteration,
+            resume_log_dir=log_dir,
+            resume_impl_output=resume_impl_output,
+        )
+        return
+
+    # Normal (non-resume) mode: require project_dir and goal.
+    if not args.project_dir:
+        parser.error("project_dir is required unless using --resume")
+    if not args.goal:
+        parser.error("goal is required unless using --resume")
 
     project_dir = os.path.abspath(args.project_dir)
     if not os.path.isdir(project_dir):
@@ -850,7 +1008,7 @@ Examples:
 
     run_loop(
         project_dir=project_dir,
-        goal=args.goal or "",
+        goal=args.goal,
         max_iterations=args.max_iterations,
         planner_model=args.planner_model,
         impl_model=args.impl_model,
@@ -859,7 +1017,6 @@ Examples:
         effort=args.effort,
         auto_commit=not args.no_auto_commit,
         dry_run=args.dry_run,
-        resume_run_id=args.resume,
     )
 
 
