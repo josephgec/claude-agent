@@ -1,5 +1,7 @@
 # Claude Agent Loop
 
+> **Writeup:** [A two-AI-loop architecture for self improvement](https://jthomas.site/blog/claude-agent.html)
+
 An outer-loop orchestrator that coordinates two Claude Code instances in a **Planner/Implementer** cycle to autonomously accomplish complex software goals.
 
 ```
